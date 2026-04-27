@@ -1,0 +1,1489 @@
+---
+title: Hookworm parasitism shapes energy status and cardiovascular disease risk in northeast Madagascar
+author: "Lev Kolinski"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    code_folding: hide
+    toc: TRUE 
+    toc_float: TRUE
+    toc_depth: 4
+---
+
+# Setup & Data Wrangling
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(MuMIn)
+library(tidySEM)
+library(DiagrammeR)
+library(DiagrammeRsvg)
+library(rsvg)
+library(ggplotify)
+library(magick)
+library(gt)
+library(lavaan)
+library(kableExtra)
+library(boot)
+library(car)
+library(patchwork)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plotting function: model-averaged coefficient plot (shared axes version)
+# ─────────────────────────────────────────────────────────────────────────────
+plot_modelavg_coef_shared <- function(coef_table, plot_title,
+                                      x_limits = NULL,
+                                      size_limits = c(1.5, 4),
+                                      importance_limits) {
+  ggplot(coef_table, aes(x = Estimate, y = PrettyVar)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray60") +
+    # 90% CI (thick)
+    geom_segment(
+      aes(x = CI_lower_90, xend = CI_upper_90, y = PrettyVar, yend = PrettyVar),
+      linewidth = 1
+    ) +
+    # 95% CI (thin)
+    geom_segment(
+      aes(x = CI_lower_95, xend = CI_upper_95, y = PrettyVar, yend = PrettyVar),
+      linewidth = 0.5
+    ) +
+    geom_point(aes(size = Importance), color = "black") +
+    scale_size_continuous(
+      limits = importance_limits,
+      range  = size_limits,
+      breaks = c(0.1, 0.3, 0.6, 1.0),
+      labels = c("0.1", "0.3", "0.6", "1.0"),
+      name   = "Variable importance\n(Akaike weight)"
+    ) +
+    coord_cartesian(xlim = x_limits) +
+    labs(x = "", y = "", title = plot_title) +
+    theme_minimal() +
+    theme(
+      axis.text.y  = element_text(size = 14),
+      axis.text.x  = element_text(size = 14),
+      plot.title   = element_text(size = 18, face = "bold")
+    )
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper: extract coefficient table from a model.avg object
+# ─────────────────────────────────────────────────────────────────────────────
+var_labels <- c(
+  "age"                              = "Age",
+  "I(age^2)"                         = "Age\u00B2",
+  "age2"                             = "Age\u00B2",
+  "BMI"                              = "BMI",
+  "log_BMI"                          = "BMI",
+  "bin_pos_necator"                  = "N. americanus",
+  "bin_pos_ancylostoma"              = "A. ceylanicum",
+  "gender_f"                         = "Female",
+  "wealth_index"                     = "Wealth",
+  "villageMandena"                   = "Village M",
+  "villageSarahandrano"              = "Village S",
+  "bin_pos_necator:wealth_index"     = "N. americanus*Wealth",
+  "bin_pos_ancylostoma:wealth_index" = "A. ceylanicum*Wealth",
+  "bin_pos_necator:gender_f"         = "N. americanus*Female",
+  "bin_pos_ancylostoma:gender_f"     = "A. ceylanicum*Female"
+)
+
+master_var_order <- c(
+  "Age", "Age\u00B2", "Female", "Village M", "Village S",
+  "BMI", "Wealth",
+  "N. americanus*Wealth", "A. ceylanicum*Wealth",
+  "N. americanus", "A. ceylanicum"
+)
+
+master_var_order_bmi <- c(
+  "Age", "Age\u00B2", "Female", "Village M", "Village S",
+  "Wealth",
+  "N. americanus*Wealth", "A. ceylanicum*Wealth",
+  "N. americanus", "A. ceylanicum"
+)
+
+master_var_order_sex <- c(
+  "Age", "Age\u00B2", "Female", "Village M", "Village S",
+  "BMI", "Wealth",
+  "N. americanus*Female", "A. ceylanicum*Female",
+  "N. americanus*Wealth",     "A. ceylanicum*Wealth",
+  "N. americanus", "A. ceylanicum"
+)
+
+master_var_order_bmi_sex <- c(
+  "Age", "Age\u00B2", "Female", "Village M", "Village S",
+  "Wealth",
+  "N. americanus*Female", "A. ceylanicum*Female",
+  "N. americanus*Wealth",     "A. ceylanicum*Wealth",
+  "N. americanus", "A. ceylanicum"
+)
+
+extract_coef_table <- function(model_avg_obj, labels = NULL) {
+  df <- summary(model_avg_obj)$coefmat.full %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column(var = "Variable") %>%
+    filter(Variable != "(Intercept)") %>%
+    mutate(
+      CI_lower_95 = Estimate - 1.96  * `Std. Error`,
+      CI_upper_95 = Estimate + 1.96  * `Std. Error`,
+      CI_lower_90 = Estimate - 1.645 * `Std. Error`,
+      CI_upper_90 = Estimate + 1.645 * `Std. Error`
+    )
+
+  imp <- sw(model_avg_obj)
+
+  df <- df %>%
+    rowwise() %>%
+    mutate(
+      Importance = {
+        if (Variable %in% names(imp)) {
+          imp[Variable]
+        } else {
+          matched_var <- names(imp)[sapply(names(imp), function(v) startsWith(Variable, v))]
+          if (length(matched_var) > 0) imp[matched_var[1]] else NA
+        }
+      }
+    ) %>%
+    ungroup() %>%
+    mutate(PrettyVar = dplyr::recode(Variable, !!!labels))
+
+  df$PrettyVar[is.na(df$PrettyVar)] <- df$Variable
+  df
+}
+
+complete_coef_table <- function(df, full_order) {
+  template <- tibble(PrettyVar = full_order)
+  df2 <- template %>% left_join(df, by = "PrettyVar")
+  df2$PrettyVar <- factor(df2$PrettyVar, levels = full_order)
+  df2
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper: stack multiple coef tables with an Outcome label
+# ─────────────────────────────────────────────────────────────────────────────
+bind_coef_tables <- function(..., outcomes) {
+  tables <- list(...)
+  purrr::map2_dfr(tables, outcomes, ~ mutate(.x, Outcome = .y))
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plotting function: overlaid estimates, colored by outcome (for blood pressure)
+# ─────────────────────────────────────────────────────────────────────────────
+plot_combined_outcomes <- function(combined_df, plot_title,
+                                   x_limits = NULL,
+                                   size_limits = c(1.5, 4),
+                                   importance_limits,
+                                   outcome_colors) {
+  
+  # Dodge offset so CIs don't overlap
+  dodge_amt <- 0.35
+  
+  combined_df <- combined_df %>%
+    mutate(Outcome = factor(Outcome, levels = names(outcome_colors)))
+  
+  # Numeric y position for dodging (ggplot handles factor y poorly with segments)
+  n_outcomes <- length(unique(combined_df$Outcome))
+  outcome_levels <- levels(combined_df$Outcome)
+  
+  combined_df <- combined_df %>%
+    mutate(
+      y_num    = as.numeric(PrettyVar),
+      out_idx  = as.numeric(Outcome),
+      y_dodge  = y_num - (out_idx - (n_outcomes + 1) / 2) * dodge_amt
+    )
+  
+  var_levels <- levels(combined_df$PrettyVar)
+  
+  ggplot(combined_df) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray60") +
+    
+    # 95% CI (thin)
+    geom_segment(
+      aes(x = CI_lower_95, xend = CI_upper_95,
+          y = y_dodge, yend = y_dodge,
+          color = Outcome),
+      linewidth = 0.5
+    ) +
+    
+    # 90% CI (thick)
+    geom_segment(
+      aes(x = CI_lower_90, xend = CI_upper_90,
+          y = y_dodge, yend = y_dodge,
+          color = Outcome),
+      linewidth = 1.5
+    ) +
+    
+    # Point estimate
+    geom_point(
+      aes(x = Estimate, y = y_dodge,
+          color = Outcome, size = Importance)
+    ) +
+    
+    scale_color_manual(values = outcome_colors, name = "Outcome") +
+    
+    scale_size_continuous(
+      limits = importance_limits,
+      range  = size_limits,
+      breaks = c(0.1, 0.3, 0.6, 1.0),
+      labels = c("0.1", "0.3", "0.6", "1.0"),
+      name   = "Variable importance\n(Akaike weight)"
+    ) +
+    
+    scale_y_continuous(
+      breaks = seq_along(var_levels),
+      labels = var_levels,
+      expand = expansion(mult = 0.05)
+    ) +
+    
+    coord_cartesian(xlim = x_limits) +
+    labs(x = NULL, y = "", title = plot_title) +
+    theme_minimal() +
+    theme(
+      axis.text.y = element_text(size = 13),
+      axis.text.x = element_text(size = 13),
+      plot.title  = element_text(size = 16, face = "bold"),
+      legend.title = element_text(size = 12),
+      legend.text  = element_text(size = 11)
+    )
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper: mean (SD) string
+# ─────────────────────────────────────────────────────────────────────────────
+mean_sd <- function(x) {
+  sprintf("%.1f (%.1f)", mean(x, na.rm = TRUE), sd(x, na.rm = TRUE))
+}
+```
+
+## Load & merge data
+
+```{r load-data}
+demo_data <- read.csv("/Users/levkolinski/Library/CloudStorage/Box-Box/EEID_Data_public/clean_data_tables/NIH Human Surveys/Survey_Demographic_Health.csv") |>
+  mutate(across(starts_with(c("own_", "banking")), ~ifelse(. == "Yes", 1L, 0L)))
+
+infection_data <- read.csv("/Users/levkolinski/Library/CloudStorage/Box-Box/EEID_Data_public/clean_data_tables/HUMAN_PARASITE_ALL_VILLAGE.csv")
+
+infection_data$social_netid <- gsub("\\.", "", infection_data$social_netid)
+demo_data$social_netid      <- gsub("\\.", "", demo_data$social_netid)
+
+merged_df <- inner_join(demo_data, infection_data, by = "social_netid") |>
+  filter(social_netid != "ESNH248") |>
+  mutate(
+    pos_necator     = ifelse((NC_reads > 500) & (Necator_americanus > 0.01),    1, 0),
+    pos_ancylostoma = ifelse((NC_reads > 500) & (Ancylostoma_ceylanicum > 0.01), 1, 0)
+  )
+```
+
+## Feature engineering
+
+```{r feature-engineering}
+merged_df <- merged_df |>
+  mutate(across(contains("systolic"),  as.numeric),
+         across(contains("diastolic"), as.numeric),
+         across(contains("height"),    as.numeric),
+         across(contains("weight"),    as.numeric),
+         age = as.numeric(age),
+         average_systolic  = (systolic1  + systolic2  + systolic3)  / 3,
+         average_diastolic = (diastolic1 + diastolic2 + diastolic3) / 3,
+         BMI = weight / height^2,
+         material_floor = ifelse(
+           grepl("bamboo|rafia|ravenala|dirt", material_floor), 0L,
+           ifelse(material_floor == "wood_planks", 1L,
+                  ifelse(material_floor == "cement", 2L, material_floor))
+         ) |> as.integer(),
+         house_toilet = ifelse(
+           grepl("In the river|No facility/bush/field", house_toilet), 0L,
+           ifelse(house_toilet == "Pit latrine", 1L,
+                  ifelse(house_toilet == "Improved pit latrine (Kabone)", 2L, house_toilet))
+         ) |> as.integer(),
+         material_wall = ifelse(
+           grepl("bamboo|rafia|ravenala|mud|compacted_earth", material_wall), 0L,
+           ifelse(material_wall == "wood_planks", 1L,
+                  ifelse(grepl("brick_fired|brick_unfired", material_wall), 2L,
+                         ifelse(material_wall == "metal_sheets", 3L,
+                                ifelse(material_wall == "cement", 4L, material_wall))))
+         ) |> as.integer(),
+         material_roof = ifelse(
+           grepl("thatch|bamboo", material_roof), 0L,
+           ifelse(material_roof == "metal_sheets", 1L,
+                  ifelse(material_roof == "cement", 2L, material_roof))
+         ) |> as.integer()
+  ) |>
+  rowwise() |>
+  mutate(
+    cgsol = sum(own_cellphone + own_generator + own_tv + own_bicycle +
+                  own_motorcycle + own_refrigerator + own_computer, na.rm = TRUE),
+    village = ifelse(village.x == "Ampandrana", "Andatsakala", village.x)
+  ) |>
+  ungroup() |>
+  mutate(hsol = material_wall + material_roof + material_floor)
+
+# Select & derive model variables
+merged_df_for_model <- merged_df |>
+  select(average_systolic, average_diastolic, BMI, age, gender, village,
+         cgsol, hsol, contains("pos"), Necator_americanus, Ancylostoma_ceylanicum) |>
+  mutate(
+    bin_pos_necator       = as.integer(pos_necator),
+    bin_pos_ancylostoma   = as.integer(pos_ancylostoma),
+    bin_systolic_htn      = ifelse(average_systolic  > 129, 1L, 0L),
+    bin_diastolic_htn     = ifelse(average_diastolic > 79,  1L, 0L),
+    bin_systolic_htn_who  = ifelse(average_systolic  > 139, 1L, 0L),
+    bin_diastolic_htn_who = ifelse(average_diastolic > 89,  1L, 0L)
+  ) |>
+  drop_na()
+
+merged_df_for_model$gender_f <- NA
+merged_df_for_model$gender_f[merged_df_for_model$gender == "Female"] <- 1L
+merged_df_for_model$gender_f[merged_df_for_model$gender == "Male"]   <- 0L
+
+# Infection group labels (for descriptive stats)
+merged_df_for_descriptive_stats <- merged_df_for_model %>%
+  mutate(
+    infection_status = case_when(
+      bin_pos_necator == 0 & bin_pos_ancylostoma == 0 ~ "Uninfected",
+      bin_pos_necator == 1 & bin_pos_ancylostoma == 0 ~ "Necator infected",
+      bin_pos_necator == 0 & bin_pos_ancylostoma == 1 ~ "Ancylostoma infected",
+      bin_pos_necator == 1 & bin_pos_ancylostoma == 1 ~ "Co-infected"
+    ),
+    village = case_when(
+      village == "Sarahandrano" ~ "Village S",
+      village == "Mandena"      ~ "Village M",
+      village == "Andatsakala"  ~ "Village A"
+    )
+  )
+
+# Scale continuous predictors
+merged_df_for_model$age_raw  <- merged_df_for_model$age
+merged_df_for_model$age      <- scale(merged_df_for_model$age)
+merged_df_for_model$log_BMI  <- scale(log(as.numeric(merged_df_for_model$BMI)))
+merged_df_for_model$cgsol    <- scale(merged_df_for_model$cgsol)
+merged_df_for_model$hsol     <- scale(merged_df_for_model$hsol)
+merged_df_for_model$log_diastolic <- scale(log(as.numeric(merged_df_for_model$average_diastolic)))
+merged_df_for_model$log_systolic  <- scale(log(as.numeric(merged_df_for_model$average_systolic)))
+
+# Wealth index (PCA of hsol + cgsol)
+pca_wealth <- prcomp(merged_df_for_model %>% select(hsol, cgsol), scale. = TRUE)
+summary(pca_wealth)
+merged_df_for_model$wealth_index <- pca_wealth$x[, 1]
+
+# Village dummy variables
+merged_df_for_model$village_mandena      <- ifelse(merged_df_for_model$village == "Mandena",      1, 0)
+merged_df_for_model$village_sarahandrano <- ifelse(merged_df_for_model$village == "Sarahandrano", 1, 0)
+
+# Infection status label (for model df)
+merged_df_for_model <- merged_df_for_model %>%
+  mutate(
+    infection_status = case_when(
+      bin_pos_necator == 0 & bin_pos_ancylostoma == 0 ~ "Uninfected",
+      bin_pos_necator == 1 & bin_pos_ancylostoma == 0 ~ "Necator infected",
+      bin_pos_necator == 0 & bin_pos_ancylostoma == 1 ~ "Ancylostoma infected",
+      bin_pos_necator == 1 & bin_pos_ancylostoma == 1 ~ "Co-infected"
+    )
+  )
+
+# Quadratic age term
+merged_df_for_model$age2 <- merged_df_for_model$age^2
+```
+
+---
+
+# Analysis
+
+## Descriptive Statistics
+
+### Demographics
+
+```{r descriptive-stats}
+# Continuous variables
+continuous_summary <- merged_df_for_descriptive_stats %>%
+  group_by(infection_status) %>%
+  summarise(
+    `Age (years)`       = mean_sd(age),
+    `BMI (kg/m²)`       = mean_sd(BMI),
+    `Systolic BP (mmHg)` = mean_sd(average_systolic),
+    `Diastolic BP (mmHg)` = mean_sd(average_diastolic)
+  ) %>%
+  pivot_longer(-infection_status, names_to = "Variable", values_to = "Value")
+
+wealth_summary <- merged_df_for_model |>
+  group_by(infection_status) |>
+  summarise(Wealth = mean_sd(wealth_index)) |>
+  pivot_longer(-infection_status, names_to = "Variable", values_to = "Value")
+
+sex_summary <- merged_df_for_descriptive_stats %>%
+  group_by(infection_status) %>%
+  summarise(
+    `Female (%)` = sprintf("%d%% (n=%d)", round(mean(gender_f, na.rm = TRUE) * 100), sum(gender_f, na.rm = TRUE)),
+    `Male (%)`   = sprintf("%d%% (n=%d)", round((1 - mean(gender_f, na.rm = TRUE)) * 100), sum(gender_f == 0, na.rm = TRUE))
+  ) %>%
+  pivot_longer(-infection_status, names_to = "Variable", values_to = "Value")
+
+village_summary <- merged_df_for_descriptive_stats %>%
+  group_by(infection_status, village) %>%
+  tally() %>%
+  group_by(infection_status) %>%
+  mutate(percent = round(100 * n / sum(n))) %>%
+  ungroup() %>%
+  mutate(Variable = village, Value = sprintf("%d%% (n=%d)", percent, n)) %>%
+  select(infection_status, Variable, Value)
+
+n_row <- merged_df_for_descriptive_stats %>%
+  group_by(infection_status) %>%
+  summarise(Value = as.character(n()), Variable = "N") %>%
+  select(Variable, everything())
+
+table_all <- bind_rows(continuous_summary, wealth_summary, sex_summary, village_summary, n_row) %>%
+  pivot_wider(names_from = infection_status, values_from = Value) %>%
+  relocate(Variable)
+
+final_table <- table_all %>%
+  gt() %>%
+  tab_header(title = "Descriptive statistics by infection status") %>%
+  cols_label(Variable = "", Uninfected = "Uninfected",
+             `Necator infected` = "Necator infected",
+             `Ancylostoma infected` = "Ancylostoma infected",
+             `Co-infected` = "Co-infected") %>%
+  tab_spanner(label = "Infection Status",
+              columns = c(Uninfected, `Necator infected`, `Ancylostoma infected`, `Co-infected`)) %>%
+  sub_missing(columns = everything(), missing_text = "")
+
+final_table |>
+  tab_style(style = cell_text(weight = "bold"),
+            locations = cells_body(rows = Variable == "N"))
+
+# Gender bar chart
+gender_data <- merged_df_for_model |> count(gender)
+ggplot(data = gender_data, aes(x = gender, y = n, fill = gender)) +
+  geom_bar(stat = "identity") +
+  scale_fill_viridis_d(begin = 0.2, end = 1) +
+  ggtitle("Gender distribution (N=874)") +
+  labs(x = NULL, y = "Number of participants") +
+  theme(text = element_text(size = 16), axis.text = element_text(size = 16, angle = 80),
+        legend.position = "none")
+
+# Age distribution
+merged_df_for_model$age_raw <- as.numeric(merged_df_for_model$age_raw)
+labs_age <- c("18-19", paste(seq(20, 95, by = 5), seq(24, 99, by = 5), sep = "-"), "100+")
+breaks_age <- c(18, 20, seq(25, 100, by = 5), Inf)
+merged_df_for_model$AgeGroup <- cut(merged_df_for_model$age_raw, breaks = breaks_age,
+                                    labels = labs_age, right = FALSE)
+
+n_age_groups <- merged_df_for_model %>% count(AgeGroup) %>% filter(!is.na(AgeGroup))
+
+ggplot(data = n_age_groups, aes(x = AgeGroup, y = n, fill = AgeGroup)) +
+  scale_fill_viridis_d(end = .8) +
+  geom_bar(stat = "identity") +
+  ggtitle("Age distribution (N=874)") +
+  labs(x = "Age", y = "Number of participants") +
+  theme(text = element_text(size = 14), axis.text = element_text(size = 14, angle = 80),
+        legend.position = "none")
+
+cat("Mean age:", mean(merged_df_for_model$age_raw, na.rm = TRUE))
+cat("SD age:",   sd(merged_df_for_model$age_raw,   na.rm = TRUE))
+```
+
+### Helminth Infection
+
+```{r infection-prev}
+n_necator     <- sum(merged_df_for_model$bin_pos_necator)
+n_ancylostoma <- sum(merged_df_for_model$bin_pos_ancylostoma)
+N             <- nrow(merged_df_for_model)
+
+cat("Necator prevalence:    ", paste0(round(n_necator / N * 100, 2), "%"), "\n")
+cat("Ancylostoma prevalence:", paste0(round(n_ancylostoma / N * 100, 2), "%"), "\n")
+```
+
+### BMI
+
+```{r bmi-descriptive}
+cat("Mean BMI:", mean(merged_df_for_model$BMI, na.rm = TRUE), "\n")
+cat("SD BMI:",   sd(merged_df_for_model$BMI,   na.rm = TRUE), "\n")
+
+n_underweight <- sum(merged_df_for_model$BMI < 18.5, na.rm = TRUE)
+n_overweight  <- sum(merged_df_for_model$BMI > 25,   na.rm = TRUE)
+cat("Underweight (<18.5):", paste0(round(n_underweight / N * 100, 2), "%"), "(n =", n_underweight, ")\n")
+cat("Overweight  (>25):  ", paste0(round(n_overweight  / N * 100, 2), "%"), "(n =", n_overweight,  ")\n")
+
+ggplot(data = merged_df_for_model, aes(x = BMI)) +
+  geom_histogram(color = "white", fill = "#2c3e50", bins = 30) +
+  ylim(0, 120) +
+  annotate("rect",  xmin = 18.5, xmax = 24.9, ymin = 0, ymax = Inf, fill = "pink",       alpha = 0.3) +
+  annotate("rect",  xmin = 25,   xmax = Inf,  ymin = 0, ymax = Inf, fill = "lightgreen", alpha = 0.3) +
+  annotate("rect",  xmin = -Inf, xmax = 18.49, ymin = 0, ymax = Inf, fill = "lightblue",  alpha = 0.3) +
+  annotate("text",  x = 21.7, y = Inf, label = '"Normal"', vjust = 2, size = 5, color = "darkred") +
+  annotate("text",  x = 30,   y = Inf, label = '"Over"',   vjust = 2, size = 5, color = "darkgreen") +
+  annotate("text",  x = 16,   y = Inf, label = '"Under"',  vjust = 2, size = 5, color = "darkblue") +
+  labs(x = "BMI", y = NULL) +
+  theme_minimal(base_size = 14) +
+  ggtitle("Distribution of BMI (N = 874)")
+```
+
+### Blood Pressure
+
+```{r bp-descriptive}
+n_hypertensive <- merged_df_for_model |> filter(average_systolic > 129 | average_diastolic > 79) |> nrow()
+cat("Hypertensive (systolic >129 OR diastolic >79):", paste0(round(n_hypertensive / N * 100, 2), "%"), "\n")
+
+ggplot(merged_df_for_model, aes(x = age, y = average_systolic, color = gender)) +
+  geom_point() +
+  labs(x = "Age (scaled)", y = "Average systolic BP") +
+  geom_hline(yintercept = 130, color = "black") +
+  ggtitle("Systolic blood pressure and age (N=874)")
+
+ggplot(merged_df_for_model, aes(x = age, y = average_diastolic, color = gender)) +
+  geom_point() +
+  labs(x = "Age (scaled)", y = "Average diastolic BP") +
+  geom_hline(yintercept = 80, color = "black") +
+  ggtitle("Diastolic blood pressure (N=874)")
+```
+
+---
+
+## BMI Analyses
+
+### Model Averaging (Main)
+
+```{r bmi-model-avg}
+bmi_model_1 <- lm(
+  log_BMI ~ village + age + I(age^2) + gender_f + wealth_index +
+    bin_pos_necator + bin_pos_ancylostoma +
+    bin_pos_necator:wealth_index + bin_pos_ancylostoma:wealth_index,
+  data = merged_df_for_model, na.action = na.fail
+)
+
+dredged_bmi_model_1  <- dredge(bmi_model_1, subset = !(`I(age^2)`) | age)
+averaged_bmi_model_1 <- model.avg(dredged_bmi_model_1, subset = delta < 2)
+
+summary(averaged_bmi_model_1)
+sw(averaged_bmi_model_1)
+
+coef_bmi <- extract_coef_table(averaged_bmi_model_1, labels = var_labels)
+coef_bmi <- complete_coef_table(coef_bmi, master_var_order_bmi)
+
+p_bmi <- plot_modelavg_coef_shared(
+  coef_bmi, "BMI",
+  x_limits = c(-0.4, 0.6),
+  importance_limits = c(0.1, 1)
+)
+p_bmi + theme(legend.position = "right")
+
+ggsave("bmi_plot_main.jpeg", path = "/Users/levkolinski/Desktop/hookworm_bmi_bloodpressure/Figures/", 
+       units="in", width=10, height=7, dpi=350, device = "jpeg", bg = "white")
+
+# Get the scaling parameters used for log_BMI
+log_bmi_values <- log(as.numeric(merged_df_for_model$BMI))
+mu_log_bmi <- attr(merged_df_for_model$log_BMI, "scaled:center")  # mean of log(BMI)
+sd_log_bmi <- attr(merged_df_for_model$log_BMI, "scaled:scale")   # SD of log(BMI)
+
+# Necator coefficient on z-scaled log(BMI) — pull from your model avg object
+necator_coef_z <- coef(averaged_bmi_model_1)["bin_pos_necator"]
+
+# Convert: change in log(BMI) on original scale
+delta_log_bmi <- necator_coef_z * sd_log_bmi  # e.g. -0.170 * sd
+
+# Expected BMI for an average (z=0) person, with and without infection
+bmi_uninfected <- exp(mu_log_bmi)
+bmi_infected   <- exp(mu_log_bmi + delta_log_bmi)
+
+# Absolute and % change
+delta_bmi_abs <- bmi_infected - bmi_uninfected
+delta_bmi_pct <- (bmi_infected / bmi_uninfected - 1) * 100
+
+cat("Mean log(BMI):", round(mu_log_bmi, 4), "\n")
+cat("SD log(BMI):", round(sd_log_bmi, 4), "\n")
+cat("Necator coef (z-scale):", round(necator_coef_z, 4), "\n")
+cat("Δ log(BMI) (original log scale):", round(delta_log_bmi, 4), "\n")
+cat("BMI uninfected with Necator:", round(bmi_uninfected, 4), "\n")
+cat("BMI infected with Necator:", round(bmi_infected, 4), "\n")
+cat("Δ BMI:", round(delta_bmi_abs, 4), "kg/m²\n")
+cat("% change:", round(delta_bmi_pct, 4), "%\n")
+```
+
+### Bootstrap Bonferroni-adjusted Pairwise Comparisons — BMI
+
+```{r bmi-bootstrap}
+# Create 3-level infection group variables
+create_infection_group <- function(main_var, other_vars, df) {
+  main_bin  <- paste0("bin_", main_var)
+  others_bin <- paste0("bin_", other_vars)
+  df %>%
+    mutate(!!main_var := case_when(
+      .data[[main_bin]] == 0 ~ "Uninfected",
+      .data[[main_bin]] == 1 & rowSums(across(all_of(others_bin))) == 0 ~ "Infected only",
+      .data[[main_bin]] == 1 & rowSums(across(all_of(others_bin))) > 0  ~ "Coinfected"
+    ))
+}
+
+infection_vars      <- c("pos_necator", "pos_ancylostoma")
+pairwise_comparisons <- combn(c("Uninfected", "Infected only", "Coinfected"), 2, simplify = FALSE)
+
+for (var in infection_vars) {
+  merged_df_for_model <- create_infection_group(var, setdiff(infection_vars, var), merged_df_for_model)
+}
+
+bootstrap_pairwise_diff_bmi <- function(df, group_var, group1, group2, outcome = "log_BMI") {
+  df_sub <- df |> filter(.data[[group_var]] %in% c(group1, group2)) |> drop_na()
+  df_sub[[group_var]] <- droplevels(factor(df_sub[[group_var]], levels = c(group1, group2)))
+
+  boot_fun <- function(data, indices) {
+    d <- data[indices, ]
+    if (length(unique(d[[group_var]])) < 2) return(NA)
+    f     <- as.formula(paste(outcome, "~", group_var, "+ village + age + I(age^2) + wealth_index + gender"))
+    model <- tryCatch(lm(f, data = d), error = function(e) NULL)
+    if (is.null(model) || any(is.na(coef(model)))) return(NA)
+    preds <- d; preds[[group_var]] <- group1; mean1 <- mean(predict(model, newdata = preds), na.rm = TRUE)
+    preds[[group_var]] <- group2;             mean2 <- mean(predict(model, newdata = preds), na.rm = TRUE)
+    mean2 - mean1
+  }
+
+  set.seed(1234)
+  boot_out <- boot(df_sub, statistic = boot_fun, R = 1000)
+  boot_out$t <- boot_out$t[!is.na(boot_out$t), , drop = FALSE]
+  boot_out$R <- nrow(boot_out$t)
+
+  alpha_bonf <- 0.05 / length(pairwise_comparisons)
+  ci  <- quantile(boot_out$t, c(alpha_bonf / 2, 1 - alpha_bonf / 2))
+  p   <- min(1, (2 * min(mean(boot_out$t > 0), mean(boot_out$t < 0))) * length(pairwise_comparisons))
+
+  data.frame(Infection = group_var, Group1 = group1, Group2 = group2,
+             Mean_diff_g2_minus_g1 = round(mean(boot_out$t), 3),
+             SE = round(sd(boot_out$t), 3), p = round(p, 3),
+             CI_lower = round(ci[1], 3), CI_upper = round(ci[2], 3))
+}
+
+all_results_BMI <- list()
+for (var in infection_vars)
+  for (pair in pairwise_comparisons)
+    all_results_BMI[[length(all_results_BMI) + 1]] <-
+      bootstrap_pairwise_diff_bmi(merged_df_for_model, var, pair[1], pair[2])
+
+comparison_table_bmi <- bind_rows(all_results_BMI)
+kable(comparison_table_bmi,
+      caption = "Bootstrap Bonferroni pairwise comparisons: parasite infection status ~ BMI (adjusted for age, age², sex, village, wealth)")
+```
+
+---
+
+## Blood Pressure Analyses
+
+### Model Averaging — Systolic BP (Continuous)
+
+```{r systolic-model-avg}
+systolic_model_1 <- lm(
+  log_systolic ~ village + log_BMI + age + I(age^2) + gender_f + wealth_index +
+    bin_pos_necator + bin_pos_necator:wealth_index +
+    bin_pos_ancylostoma + bin_pos_ancylostoma:wealth_index,
+  data = merged_df_for_model, na.action = na.fail
+)
+
+dredged_systolic_model_1  <- dredge(systolic_model_1, subset = !(`I(age^2)`) | age)
+averaged_systolic_model_1 <- model.avg(dredged_systolic_model_1, subset = delta < 2)
+
+summary(averaged_systolic_model_1)
+sw(averaged_systolic_model_1)
+
+
+# Get the scaling parameters used for log systolic
+log_systolic_values <- log(as.numeric(merged_df_for_model$average_systolic))
+mu_log_systolic <- attr(merged_df_for_model$log_systolic, "scaled:center")  
+sd_log_systolic <- attr(merged_df_for_model$log_systolic, "scaled:scale") 
+# Necator coefficient on z-scaled log(systolic) — pull from your model avg object
+necator_coef_z <- coef(averaged_systolic_model_1)["bin_pos_necator"]
+ancylostoma_coef_z <- coef(averaged_systolic_model_1)["bin_pos_ancylostoma"]
+
+# Convert: change in log(systolic) on original scale
+delta_log_systolic <- necator_coef_z * sd_log_systolic  
+delta_log_systolic_anc <- ancylostoma_coef_z * sd_log_systolic  
+
+# Expected BMI for an average (z=0) person, with and without infection
+systolic_uninfected <- exp(mu_log_systolic)
+systolic_infected   <- exp(mu_log_systolic + delta_log_systolic)
+systolic_infected_anc   <- exp(mu_log_systolic + delta_log_systolic_anc)
+
+
+# Absolute and % change
+delta_systolic_abs <- systolic_infected - systolic_uninfected
+delta_systolic_pct <- (systolic_infected / systolic_uninfected - 1) * 100
+
+delta_systolic_abs_anc <- systolic_infected_anc - systolic_uninfected
+delta_systolic_pct_anc <- (systolic_infected_anc / systolic_uninfected - 1) * 100
+
+
+cat("Mean log(systolic):", round(mu_log_systolic, 4), "\n")
+cat("SD log(systolic):", round(sd_log_systolic, 4), "\n")
+cat("Necator coef (z-scale):", round(necator_coef_z, 4), "\n")
+cat("Δ log(systolic) (original log scale):", round(delta_log_systolic, 4), "\n")
+cat("systolic uninfected with Necator:", round(systolic_uninfected, 4), "\n")
+cat("systolic infected with Necator:", round(systolic_infected, 4), "\n")
+cat("Δ systolic:", round(delta_systolic_abs, 4), "mmHg\n")
+cat("% change:", round(delta_systolic_pct, 4), "%\n")
+
+cat("Ancylostoma coef (z-scale):", round(ancylostoma_coef_z, 4), "\n")
+cat("Δ log(systolic) (original log scale):", round(delta_log_systolic_anc, 4), "\n")
+cat("systolic uninfected with Ancylostoma:", round(systolic_uninfected, 4), "\n")
+cat("systolic infected with Ancylostoma:", round(systolic_infected_anc, 4), "\n")
+cat("Δ systolic:", round(delta_systolic_abs_anc, 4), "mmHg\n")
+cat("% change:", round(delta_systolic_pct_anc, 4), "%\n")
+```
+
+### Model Averaging — Systolic Hypertension (Binary, >130 mmHg)
+
+```{r systolic-htn-model-avg}
+systolic_htn_model <- glm(
+  bin_systolic_htn ~ village + log_BMI + age + I(age^2) + gender_f + wealth_index +
+    bin_pos_necator + bin_pos_necator:wealth_index +
+    bin_pos_ancylostoma + bin_pos_ancylostoma:wealth_index,
+  data = merged_df_for_model, na.action = na.fail, family = "binomial"
+)
+
+dredged_systolic_htn_model  <- dredge(systolic_htn_model, subset = !(`I(age^2)`) | age)
+averaged_systolic_htn_model <- model.avg(dredged_systolic_htn_model, subset = delta < 2)
+
+summary(averaged_systolic_htn_model)
+sw(averaged_systolic_htn_model)
+```
+
+### Model Averaging — Diastolic BP (Continuous)
+
+```{r diastolic-model-avg}
+diastolic_model_1 <- lm(
+  log_diastolic ~ village + log_BMI + age + I(age^2) + gender_f + wealth_index +
+    bin_pos_necator + bin_pos_necator:wealth_index +
+    bin_pos_ancylostoma + bin_pos_ancylostoma:wealth_index,
+  data = merged_df_for_model, na.action = na.fail
+)
+
+dredged_diastolic_model_1  <- dredge(diastolic_model_1, subset = !(`I(age^2)`) | age)
+averaged_diastolic_model_1 <- model.avg(dredged_diastolic_model_1, subset = delta < 2)
+
+summary(averaged_diastolic_model_1)
+sw(averaged_diastolic_model_1)
+
+
+# Get the scaling parameters used for log diastolic
+log_diastolic_values <- log(as.numeric(merged_df_for_model$average_diastolic))
+mu_log_diastolic <- attr(merged_df_for_model$log_diastolic, "scaled:center")  
+sd_log_diastolic <- attr(merged_df_for_model$log_diastolic, "scaled:scale") 
+# Necator coefficient on z-scaled log(diastolic) — pull from your model avg object
+necator_coef_z <- coef(averaged_diastolic_model_1)["bin_pos_necator"]
+ancylostoma_coef_z <- coef(averaged_diastolic_model_1)["bin_pos_ancylostoma"]
+
+# Convert: change in log(diastolic) on original scale
+delta_log_diastolic <- necator_coef_z * sd_log_diastolic  
+delta_log_diastolic_anc <- ancylostoma_coef_z * sd_log_diastolic  
+
+# Expected BMI for an average (z=0) person, with and without infection
+diastolic_uninfected <- exp(mu_log_diastolic)
+diastolic_infected   <- exp(mu_log_diastolic + delta_log_diastolic)
+diastolic_infected_anc   <- exp(mu_log_diastolic + delta_log_diastolic_anc)
+
+
+# Absolute and % change
+delta_diastolic_abs <- diastolic_infected - diastolic_uninfected
+delta_diastolic_pct <- (diastolic_infected / diastolic_uninfected - 1) * 100
+
+delta_diastolic_abs_anc <- diastolic_infected_anc - diastolic_uninfected
+delta_diastolic_pct_anc <- (diastolic_infected_anc / diastolic_uninfected - 1) * 100
+
+
+cat("Mean log(diastolic):", round(mu_log_diastolic, 4), "\n")
+cat("SD log(diastolic):", round(sd_log_diastolic, 4), "\n")
+cat("Necator coef (z-scale):", round(necator_coef_z, 4), "\n")
+cat("Δ log(diastolic) (original log scale):", round(delta_log_diastolic, 4), "\n")
+cat("diastolic uninfected with Necator:", round(diastolic_uninfected, 4), "\n")
+cat("diastolic infected with Necator:", round(diastolic_infected, 4), "\n")
+cat("Δ diastolic:", round(delta_diastolic_abs, 4), "mmHg\n")
+cat("% change:", round(delta_diastolic_pct, 4), "%\n")
+
+cat("Ancylostoma coef (z-scale):", round(ancylostoma_coef_z, 4), "\n")
+cat("Δ log(diastolic) (original log scale):", round(delta_log_diastolic_anc, 4), "\n")
+cat("diastolic uninfected with Ancylostoma:", round(diastolic_uninfected, 4), "\n")
+cat("diastolic infected with Ancylostoma:", round(diastolic_infected_anc, 4), "\n")
+cat("Δ diastolic:", round(delta_diastolic_abs_anc, 4), "mmHg\n")
+cat("% change:", round(delta_diastolic_pct_anc, 4), "%\n")
+```
+
+### Model Averaging — Diastolic Hypertension (Binary, >80 mmHg)
+
+```{r diastolic-htn-model-avg}
+diastolic_htn_model <- glm(
+  bin_diastolic_htn ~ village + log_BMI + age + I(age^2) + gender_f + wealth_index +
+    bin_pos_necator + bin_pos_necator:wealth_index +
+    bin_pos_ancylostoma + bin_pos_ancylostoma:wealth_index,
+  data = merged_df_for_model, na.action = na.fail, family = "binomial"
+)
+
+dredged_diastolic_htn_model  <- dredge(diastolic_htn_model, subset = !(`I(age^2)`) | age)
+averaged_diastolic_htn_model <- model.avg(dredged_diastolic_htn_model, subset = delta < 2)
+
+summary(averaged_diastolic_htn_model)
+sw(averaged_diastolic_htn_model)
+```
+
+### Combined Coefficient Plot — Blood Pressure Models
+
+```{r bp-coef-plots, fig.width=12, fig.height=8}
+coef_sys     <- extract_coef_table(averaged_systolic_model_1,  labels = var_labels) |> complete_coef_table(master_var_order)
+coef_sys_htn <- extract_coef_table(averaged_systolic_htn_model, labels = var_labels) |> complete_coef_table(master_var_order)
+coef_dia     <- extract_coef_table(averaged_diastolic_model_1,  labels = var_labels) |> complete_coef_table(master_var_order)
+coef_dia_htn <- extract_coef_table(averaged_diastolic_htn_model, labels = var_labels) |> complete_coef_table(master_var_order)
+
+combined_bp <- bind_coef_tables(
+  coef_sys, coef_dia,
+  outcomes = c("Systolic", "Diastolic")
+)
+
+combined_htn <- bind_coef_tables(
+  coef_sys_htn, coef_dia_htn,
+  outcomes = c("Systolic", "Diastolic")
+)
+
+importance_range <- range(c(combined_htn$Importance, combined_bp$Importance), na.rm = TRUE)
+
+x_range <- range(c(combined_htn$CI_lower_95, combined_bp$CI_upper_95), na.rm = TRUE) * 1.1
+
+bp_colors <- c(
+  "Systolic"  = "#E69F00",  
+  "Diastolic" = "#0072B2"  ) 
+
+htn_colors <- c(
+  "Systolic"  = "#E69F00",  
+  "Diastolic" = "#0072B2"  )
+
+p_bp <- plot_combined_outcomes(
+  combined_bp,
+  plot_title        = "Continuous Blood Pressure",
+  x_limits          = c(-0.5, 0.6),
+  importance_limits = importance_range,
+  outcome_colors    = bp_colors
+)
+
+p_htn <- plot_combined_outcomes(
+  combined_htn,
+  plot_title        = "Hypertension (Logit-linked)",
+  x_limits          = c(-1, 1),
+  importance_limits = importance_range,
+  outcome_colors    = htn_colors
+)
+combined_plot <- (p_bp | p_htn)  +
+  plot_layout(guides = "collect") & theme(legend.position = "bottom")
+
+combined_plot + plot_annotation(tag_levels = "A")
+
+ggsave("bp_plot_main.jpeg", path = "/Users/levkolinski/Desktop/hookworm_bmi_bloodpressure/Figures/", 
+       units="in", width=13, height=8, dpi=350, device = "jpeg", bg = "white")
+
+```
+
+### Bootstrap Bonferroni-adjusted Pairwise Comparisons — Blood Pressure
+
+```{r bp-bootstrap}
+bootstrap_pairwise_diff_blood_pressure <- function(df, group_var, group1, group2, outcome) {
+  df_sub <- df |> filter(.data[[group_var]] %in% c(group1, group2)) |> drop_na()
+  df_sub[[group_var]] <- droplevels(factor(df_sub[[group_var]], levels = c(group1, group2)))
+
+  boot_fun <- function(data, indices) {
+    d <- data[indices, ]
+    if (length(unique(d[[group_var]])) < 2) return(NA)
+    f     <- as.formula(paste(outcome, "~", group_var, "+ village + log_BMI + age + I(age^2) + wealth_index + gender"))
+    model <- tryCatch(lm(f, data = d), error = function(e) NULL)
+    if (is.null(model) || any(is.na(coef(model)))) return(NA)
+    preds <- d; preds[[group_var]] <- group1; mean1 <- mean(predict(model, newdata = preds), na.rm = TRUE)
+    preds[[group_var]] <- group2;             mean2 <- mean(predict(model, newdata = preds), na.rm = TRUE)
+    mean2 - mean1
+  }
+
+  set.seed(1234)
+  boot_out <- boot(df_sub, statistic = boot_fun, R = 1000)
+  boot_out$t <- boot_out$t[!is.na(boot_out$t), , drop = FALSE]
+  boot_out$R <- nrow(boot_out$t)
+
+  alpha_bonf <- 0.05 / length(pairwise_comparisons)
+  ci  <- quantile(boot_out$t, c(alpha_bonf / 2, 1 - alpha_bonf / 2))
+  p   <- min(1, (2 * min(mean(boot_out$t > 0), mean(boot_out$t < 0))) * length(pairwise_comparisons))
+
+  data.frame(Infection = group_var, Group1 = group1, Group2 = group2,
+             Mean_diff_g2_minus_g1 = round(mean(boot_out$t), 3),
+             SE = round(sd(boot_out$t), 3), p = round(p, 3),
+             CI_lower = round(ci[1], 3), CI_upper = round(ci[2], 3))
+}
+
+all_results_systolic  <- list()
+all_results_diastolic <- list()
+
+for (var in infection_vars) {
+  for (pair in pairwise_comparisons) {
+    all_results_systolic[[length(all_results_systolic) + 1]] <-
+      bootstrap_pairwise_diff_blood_pressure(merged_df_for_model, var, pair[1], pair[2], "log_systolic")
+    all_results_diastolic[[length(all_results_diastolic) + 1]] <-
+      bootstrap_pairwise_diff_blood_pressure(merged_df_for_model, var, pair[1], pair[2], "log_diastolic")
+  }
+}
+
+comparison_table_systolic  <- bind_rows(all_results_systolic)
+comparison_table_diastolic <- bind_rows(all_results_diastolic)
+
+kable(comparison_table_systolic,  caption = "Bootstrap Bonferroni pairwise comparisons: parasite infection ~ systolic BP (adjusted for age, age², sex, BMI, village, wealth)")
+kable(comparison_table_diastolic, caption = "Bootstrap Bonferroni pairwise comparisons: parasite infection ~ diastolic BP (adjusted for age, age², sex, BMI, village, wealth)")
+```
+
+---
+
+## Structural Equation Modeling
+
+Model fit cutoffs: CFI ≥ 0.80, RMSEA ≤ 0.08, SRMR ≤ 0.08, TLI ≥ 0.80
+
+### Systolic BP — Continuous
+
+```{r sem-systolic-continuous}
+sem_systolic_continuous <- '
+  log_BMI ~ a1*bin_pos_necator + a2*bin_pos_ancylostoma +
+            a3*age + a3q*age2 + a4*gender_f + a5*wealth_index
+
+  log_systolic ~ b*log_BMI +
+                 c1p*bin_pos_necator + c2p*bin_pos_ancylostoma +
+                 c3p*age + c3qp*age2 + c4p*gender_f + c5p*wealth_index +
+                 c6p*village_mandena + c7p*village_sarahandrano
+
+  ind_Necator     := a1  * b
+  ind_Ancylostoma := a2  * b
+  ind_age         := a3  * b
+  ind_age2        := a3q * b
+  ind_gender_f    := a4  * b
+  ind_wealth      := a5  * b
+
+  total_Necator     := c1p  + ind_Necator
+  total_Ancylostoma := c2p  + ind_Ancylostoma
+  total_age         := c3p  + ind_age
+  total_age2        := c3qp + ind_age2
+  total_gender_f    := c4p  + ind_gender_f
+  total_wealth      := c5p  + ind_wealth
+'
+fit_sem_systolic_continous <- sem(sem_systolic_continuous, data = merged_df_for_model, missing = "ML")
+summary(fit_sem_systolic_continous, standardized = TRUE, fit.measures = TRUE)
+```
+
+### Systolic Hypertension — Binary (>130 mmHg)
+
+```{r sem-systolic-htn}
+sem_systolic_hypertension <- '
+  log_BMI ~ a1*bin_pos_necator + a2*bin_pos_ancylostoma +
+            a3*age + a3q*age2 + a4*gender_f + a5*wealth_index
+
+  bin_systolic_htn ~ b*log_BMI +
+                     c1p*bin_pos_necator + c2p*bin_pos_ancylostoma +
+                     c3p*age + c3qp*age2 + c4p*gender_f + c5p*wealth_index +
+                     c6p*village_mandena + c7p*village_sarahandrano
+
+  ind_Necator     := a1  * b
+  ind_Ancylostoma := a2  * b
+  ind_age         := a3  * b
+  ind_age2        := a3q * b
+  ind_gender_f    := a4  * b
+  ind_wealth      := a5  * b
+
+  total_Necator     := c1p  + ind_Necator
+  total_Ancylostoma := c2p  + ind_Ancylostoma
+  total_age         := c3p  + ind_age
+  total_age2        := c3qp + ind_age2
+  total_gender_f    := c4p  + ind_gender_f
+  total_wealth      := c5p  + ind_wealth
+'
+fit_sem_systolic_htn <- sem(sem_systolic_hypertension, data = merged_df_for_model,
+                            ordered = "bin_systolic_htn", estimator = "WLSMV")
+summary(fit_sem_systolic_htn, standardized = TRUE, fit.measures = TRUE)
+```
+
+### Diastolic BP — Continuous
+
+```{r sem-diastolic-continuous}
+sem_diastolic_continuous <- '
+  log_BMI ~ a1*bin_pos_necator + a2*bin_pos_ancylostoma +
+            a3*age + a3q*age2 + a4*gender_f + a5*wealth_index
+
+  log_diastolic ~ b*log_BMI +
+                  c1p*bin_pos_necator + c2p*bin_pos_ancylostoma +
+                  c3p*age + c3qp*age2 + c4p*gender_f + c5p*wealth_index +
+                  c6p*village_mandena + c7p*village_sarahandrano
+
+  ind_Necator     := a1  * b
+  ind_Ancylostoma := a2  * b
+  ind_age         := a3  * b
+  ind_age2        := a3q * b
+  ind_gender_f    := a4  * b
+  ind_wealth      := a5  * b
+
+  total_Necator     := c1p  + ind_Necator
+  total_Ancylostoma := c2p  + ind_Ancylostoma
+  total_age         := c3p  + ind_age
+  total_age2        := c3qp + ind_age2
+  total_gender_f    := c4p  + ind_gender_f
+  total_wealth      := c5p  + ind_wealth
+'
+fit_sem_diastolic_continous <- sem(sem_diastolic_continuous, data = merged_df_for_model, missing = "ML")
+summary(fit_sem_diastolic_continous, standardized = TRUE, fit.measures = TRUE)
+```
+
+### Diastolic Hypertension — Binary (>80 mmHg)
+
+```{r sem-diastolic-htn}
+sem_diastolic_hypertension <- '
+  log_BMI ~ a1*bin_pos_necator + a2*bin_pos_ancylostoma +
+            a3*age + a3q*age2 + a4*gender_f + a5*wealth_index
+
+  bin_diastolic_htn ~ b*log_BMI +
+                      c1p*bin_pos_necator + c2p*bin_pos_ancylostoma +
+                      c3p*age + c3qp*age2 + c4p*gender_f + c5p*wealth_index +
+                      c6p*village_mandena + c7p*village_sarahandrano
+
+  ind_Necator     := a1  * b
+  ind_Ancylostoma := a2  * b
+  ind_age         := a3  * b
+  ind_age2        := a3q * b
+  ind_gender_f    := a4  * b
+  ind_wealth      := a5  * b
+
+  total_Necator     := c1p  + ind_Necator
+  total_Ancylostoma := c2p  + ind_Ancylostoma
+  total_age         := c3p  + ind_age
+  total_age2        := c3qp + ind_age2
+  total_gender_f    := c4p  + ind_gender_f
+  total_wealth      := c5p  + ind_wealth
+'
+fit_sem_diastolic_htn <- sem(sem_diastolic_hypertension, data = merged_df_for_model,
+                             ordered = "bin_diastolic_htn", estimator = "WLSMV")
+summary(fit_sem_diastolic_htn, standardized = TRUE, fit.measures = TRUE)
+```
+
+### SEM Path Diagrams
+
+```{r sem-path-diagrams, fig.width=6, fig.height=6}
+# ── Okabe-Ito colorblind-safe palette ────────────────────────────────────────
+# Color encodes SPECIES IDENTITY consistently across all panels.
+# Significance is encoded by penwidth + linestyle, not hue.
+#
+# Species colors chosen to avoid conflict with bp_colors used in coef plot:
+#   bp_colors = c(Systolic = "#E69F00", Diastolic = "#0072B2")
+#
+#   NEC_COL  : #CC79A7  pink-purple — N. americanus
+#   ANC_COL  : #009E73  teal        — A. ceylanicum
+#   BMI_COL  : #333333  near-black  — BMI mediator (structural/neutral)
+#   NS_COL   : #999999  grey        — any non-significant path
+#
+# penwidth conventions:
+#   significant (p<.05)  : penwidth = 2.5, solid
+#   marginal   (p<.10)   : penwidth = 1.5, dashed
+#   ns                   : penwidth = 1.0, solid, NS_COL
+
+NEC_COL <- "#CC79A7"
+ANC_COL <- "#009E73"
+BMI_COL <- "#000000"
+NS_COL  <- "#999999"
+
+NEC_FILL     <- "#F5F5F0"   # neutral warm white (N. americanus)
+ANC_FILL     <- "#F5F5F0"   # neutral warm white (A. ceylanicum)
+BMI_FILL     <- "#EBEBEB"   # light grey (BMI node)
+SYS_OUT_FILL <- "#FFFFFF"   # white fill, border colored separately
+DIA_OUT_FILL <- "#FFFFFF"   # white fill, border colored separately
+
+to_gg <- function(graph, dpi = 600, width = 5000, height = 2500) {
+  svg <- export_svg(graph)
+  tmp <- tempfile(fileext = ".png")
+  rsvg_png(charToRaw(svg), file = tmp, width = width, height = height)
+  img <- magick::image_read(tmp, density = paste0(dpi, "x", dpi))
+  img <- magick::image_trim(img)
+  ggplotify::as.ggplot(img)
+}
+
+# Helper: HTML table label for the outcome node.
+# Font colors in the table follow the same species-identity convention:
+#   significant values get their species color; ns values get NS_COL.
+outcome_label <- function(title, out_fill, border_col,
+                          nec_direct,  nec_indirect,
+                          anc_direct,  anc_indirect,
+                          nec_dir_col, nec_ind_col,
+                          anc_dir_col, anc_ind_col) {
+  glue::glue('<<TABLE BORDER="3" CELLBORDER="1" CELLSPACING="0" CELLPADDING="5" BGCOLOR="{out_fill}" COLOR="{border_col}">
+  <TR>
+    <TD COLSPAN="3" ALIGN="CENTER"><B>{title}</B></TD>
+  </TR>
+  <TR>
+    <TD ALIGN="LEFT"><B>&#160;</B></TD>
+    <TD ALIGN="CENTER"><B>Direct</B></TD>
+    <TD ALIGN="CENTER"><B>Indirect</B></TD>
+  </TR>
+  <TR>
+    <TD ALIGN="LEFT"><I>N. americanus</I></TD>
+    <TD ALIGN="CENTER"><FONT COLOR="{nec_dir_col}">{nec_direct}</FONT></TD>
+    <TD ALIGN="CENTER"><FONT COLOR="{nec_ind_col}">{nec_indirect}</FONT></TD>
+  </TR>
+  <TR>
+    <TD ALIGN="LEFT"><I>A. ceylanicum</I></TD>
+    <TD ALIGN="CENTER"><FONT COLOR="{anc_dir_col}">{anc_direct}</FONT></TD>
+    <TD ALIGN="CENTER"><FONT COLOR="{anc_ind_col}">{anc_indirect}</FONT></TD>
+  </TR>
+</TABLE>>')
+}
+
+# Shared DOT template.
+# Edge significance is passed as full DOT attribute strings so each edge
+# can independently carry color, penwidth, and style.
+make_sem_plot <- function(outcome_node_label,
+                          nec_to_bmi_label,  nec_to_bmi_attrs,
+                          anc_to_bmi_label,  anc_to_bmi_attrs,
+                          bmi_to_out_label,  bmi_to_out_attrs,
+                          nec_to_out_attrs,
+                          anc_to_out_attrs,
+                          outcome_node_name = "OUT") {
+  grViz(glue::glue('
+digraph SEM {{
+  graph [layout = dot, rankdir = LR, splines = true, overlap = false,
+         nodesep = 0.6, ranksep = 0.9]
+  node [fontname = Helvetica, fontsize = 11]
+  edge [fontname = Helvetica, fontsize = 10]
+
+  Necator     [label=<<I>N. americanus</I>>,  shape=rectangle, style=filled, fillcolor="{NEC_FILL}"]
+  Ancylostoma [label=<<I>A. ceylanicum</I>>,  shape=rectangle, style=filled, fillcolor="{ANC_FILL}"]
+  BMI         [label="BMI",                   shape=rectangle, style=filled, fillcolor="{BMI_FILL}"]
+  {outcome_node_name} [label={outcome_node_label}, shape=none]
+
+  Necator     -> BMI               [label="{nec_to_bmi_label}", {nec_to_bmi_attrs}]
+  Ancylostoma -> BMI               [label="{anc_to_bmi_label}", {anc_to_bmi_attrs}]
+  BMI         -> {outcome_node_name} [label="{bmi_to_out_label}", {bmi_to_out_attrs}]
+  Necator     -> {outcome_node_name} [{nec_to_out_attrs}]
+  Ancylostoma -> {outcome_node_name} [{anc_to_out_attrs}]
+
+  {{rank=same; Necator; Ancylostoma}}
+}}'))
+}
+
+# ── Convenience attribute string builders ────────────────────────────────────
+sig_attrs      <- function(col) glue::glue('color="{col}", penwidth=2.5, style=solid')
+marginal_attrs <- function(col) glue::glue('color="{col}", penwidth=1.5, style=dashed')
+ns_attrs       <- function()    glue::glue('color="{NS_COL}", penwidth=1.0, style=solid')
+
+# ── Panel A: Continuous Systolic BP ──────────────────────────────────────────
+# Nec->BMI: p=0.008 **  | Anc->BMI: p=0.183 ns
+# BMI->BP:  p<0.001 *** | Nec->BP direct: p=0.775 ns | Anc->BP direct: p=0.029 *
+# Nec indirect: p=0.019 * (sig) | Anc indirect: p=0.198 ns
+bp_sys_label <- outcome_label(
+  title        = "Systolic Blood Pressure",
+  out_fill     = SYS_OUT_FILL,
+  border_col   = "#E69F00",
+  nec_direct   = "-0.018 (ns)", nec_indirect = "-0.028*",
+  anc_direct   = "+0.167*",     anc_indirect = "+0.017 (ns)",
+  nec_dir_col  = NS_COL,        nec_ind_col  = NEC_COL,
+  anc_dir_col  = ANC_COL,       anc_ind_col  = NS_COL
+)
+
+continuous_systolic_sem_plot <- make_sem_plot(
+  outcome_node_label = bp_sys_label,
+  outcome_node_name  = "BP",
+  nec_to_bmi_label   = "-0.170**",    nec_to_bmi_attrs = sig_attrs(NEC_COL),
+  anc_to_bmi_label   = "+0.103 (ns)", anc_to_bmi_attrs = ns_attrs(),
+  bmi_to_out_label   = "+0.164***",   bmi_to_out_attrs = sig_attrs(BMI_COL),
+  nec_to_out_attrs   = ns_attrs(),
+  anc_to_out_attrs   = sig_attrs(ANC_COL)
+)
+
+# ── Panel B: Systolic Hypertension ───────────────────────────────────────────
+# Nec->BMI: p=0.007 ** | Anc->BMI: p=0.224 ns
+# BMI->HTN: p=0.018 *  | Nec->HTN direct: p=0.035 * | Anc->HTN direct: p=0.105 ns
+# Nec indirect: p=0.077 † (marginal) | Anc indirect: p=0.280 ns
+htn_sys_label <- outcome_label(
+  title        = "Systolic Hypertension",
+  out_fill     = SYS_OUT_FILL,
+  border_col   = "#E69F00",
+  nec_direct   = "-0.201*",     nec_indirect = "-0.020\u2020",
+  anc_direct   = "+0.189 (ns)", anc_indirect = "+0.012 (ns)",
+  nec_dir_col  = NEC_COL,       nec_ind_col  = NEC_COL,
+  anc_dir_col  = NS_COL,        anc_ind_col  = NS_COL
+)
+
+systolic_htn_sem_plot <- make_sem_plot(
+  outcome_node_label = htn_sys_label,
+  outcome_node_name  = "HTN",
+  nec_to_bmi_label   = "-0.176**",    nec_to_bmi_attrs = sig_attrs(NEC_COL),
+  anc_to_bmi_label   = "+0.104 (ns)", anc_to_bmi_attrs = ns_attrs(),
+  bmi_to_out_label   = "+0.115*",     bmi_to_out_attrs = sig_attrs(BMI_COL),
+  nec_to_out_attrs   = sig_attrs(NEC_COL),
+  anc_to_out_attrs   = ns_attrs()
+)
+
+# ── Panel C: Continuous Diastolic BP ─────────────────────────────────────────
+# Nec->BMI: p=0.008 ** | Anc->BMI: p=0.183 ns
+# BMI->BP:  p<0.001 ***| Nec->BP direct: p=0.091 † | Anc->BP direct: p=0.703 ns
+# Nec indirect: p=0.025 * | Anc indirect: p=0.205 ns
+bp_dia_label <- outcome_label(
+  title        = "Diastolic Blood Pressure",
+  out_fill     = DIA_OUT_FILL,
+  border_col   = "#0072B2",
+  nec_direct   = "-0.110\u2020",  nec_indirect = "-0.024*",
+  anc_direct   = "+0.030 (ns)",   anc_indirect = "+0.014 (ns)",
+  nec_dir_col  = NEC_COL,         nec_ind_col  = NEC_COL,
+  anc_dir_col  = NS_COL,          anc_ind_col  = NS_COL
+)
+
+continuous_diastolic_sem_plot <- make_sem_plot(
+  outcome_node_label = bp_dia_label,
+  outcome_node_name  = "BP",
+  nec_to_bmi_label   = "-0.170**",    nec_to_bmi_attrs = sig_attrs(NEC_COL),
+  anc_to_bmi_label   = "+0.103 (ns)", anc_to_bmi_attrs = ns_attrs(),
+  bmi_to_out_label   = "+0.140***",   bmi_to_out_attrs = sig_attrs(BMI_COL),
+  nec_to_out_attrs   = marginal_attrs(NEC_COL),
+  anc_to_out_attrs   = ns_attrs()
+)
+
+# ── Panel D: Diastolic Hypertension ──────────────────────────────────────────
+# Nec->BMI: p=0.007 ** | Anc->BMI: p=0.224 ns
+# BMI->HTN: p=0.002 ** | Nec->HTN direct: p=0.043 * | Anc->HTN direct: p=0.854 ns
+# Nec indirect: p=0.042 * | Anc indirect: p=0.258 ns
+htn_dia_label <- outcome_label(
+  title        = "Diastolic Hypertension",
+  out_fill     = DIA_OUT_FILL,
+  border_col   = "#0072B2",
+  nec_direct   = "-0.187*",     nec_indirect = "-0.027*",
+  anc_direct   = "-0.021 (ns)", anc_indirect = "+0.016 (ns)",
+  nec_dir_col  = NEC_COL,       nec_ind_col  = NEC_COL,
+  anc_dir_col  = NS_COL,        anc_ind_col  = NS_COL
+)
+
+diastolic_htn_sem_plot <- make_sem_plot(
+  outcome_node_label = htn_dia_label,
+  outcome_node_name  = "HTN",
+  nec_to_bmi_label   = "-0.176**",    nec_to_bmi_attrs = sig_attrs(NEC_COL),
+  anc_to_bmi_label   = "+0.104 (ns)", anc_to_bmi_attrs = ns_attrs(),
+  bmi_to_out_label   = "+0.151**",    bmi_to_out_attrs = sig_attrs(BMI_COL),
+  nec_to_out_attrs   = sig_attrs(NEC_COL),
+  anc_to_out_attrs   = ns_attrs()
+)
+
+# ── Combine and save ──────────────────────────────────────────────────────────
+sem_plot_1 <- to_gg(continuous_systolic_sem_plot) + ggtitle("Systolic Blood Pressure")
+sem_plot_2 <- to_gg(systolic_htn_sem_plot)         + ggtitle("Systolic Hypertension")
+sem_plot_3 <- to_gg(continuous_diastolic_sem_plot) + ggtitle("Diastolic Blood Pressure")
+sem_plot_4 <- to_gg(diastolic_htn_sem_plot)         + ggtitle("Diastolic Hypertension")
+
+combined_sem_plots <- (sem_plot_1 | sem_plot_2) / (sem_plot_3 | sem_plot_4)
+
+combined_sem_plots +
+  plot_annotation(tag_levels = "A") +
+  plot_layout(heights = c(1, 1), widths = c(1, 1)) &
+  theme(
+    plot.margin  = margin(1, 1, 1, 1),
+    panel.spacing = unit(0, "pt"),
+    plot.title   = element_text(face = "bold", size = 13, hjust = 0.5)
+  )
+
+
+# ggsave("sem_plot_main_v2.png",
+#        path   = "/Users/levkolinski/Desktop/hookworm_bmi_bloodpressure/Figures/",
+#        units  = "in", width = 16, height = 8, dpi = 600,
+#        device = "png", bg = "white")
+```
+
+---
+
+# Supplementary
+
+## Sex × Hookworm Interaction Models
+
+### BMI — Sex Interaction
+
+```{r bmi-sex-int}
+bmi_model_with_gender_int <- lm(
+  log_BMI ~ village + age + I(age^2) + gender_f + wealth_index +
+    bin_pos_necator     + bin_pos_necator:wealth_index     + bin_pos_necator:gender_f +
+    bin_pos_ancylostoma + bin_pos_ancylostoma:wealth_index + bin_pos_ancylostoma:gender_f,
+  data = merged_df_for_model, na.action = na.fail
+)
+
+dredged_bmi_model_with_gender_int  <- dredge(bmi_model_with_gender_int)
+averaged_bmi_model_with_gender_int <- model.avg(dredged_bmi_model_with_gender_int, subset = delta < 2)
+
+summary(averaged_bmi_model_with_gender_int)
+sw(averaged_bmi_model_with_gender_int)
+
+coef_bmi_sex <- extract_coef_table(averaged_bmi_model_with_gender_int, labels = var_labels) |>
+  complete_coef_table(master_var_order_bmi_sex)
+
+p_bmi_sex <- plot_modelavg_coef_shared(coef_bmi_sex, "BMI",
+                                       x_limits = c(-0.75, 0.75),
+                                       importance_limits = c(0.2, 1))
+p_bmi_sex + theme(legend.position = "right")
+
+ggsave("bmi_sex_interaction_plot_supp.jpeg", path = "/Users/levkolinski/Desktop/hookworm_bmi_bloodpressure/Figures/", 
+       units="in", width=10, height=7, dpi=350, device = "jpeg", bg = "white")
+```
+
+### Systolic BP — Sex Interaction
+
+```{r systolic-sex-int}
+systolic_model_1_gender_int <- lm(
+  log_systolic ~ village + log_BMI + age + I(age^2) + gender_f + wealth_index +
+    bin_pos_necator     + bin_pos_necator:wealth_index     + bin_pos_necator:gender_f +
+    bin_pos_ancylostoma + bin_pos_ancylostoma:wealth_index + bin_pos_ancylostoma:gender_f,
+  data = merged_df_for_model, na.action = na.fail
+)
+
+dredged_systolic_model_1_gender_int  <- dredge(systolic_model_1_gender_int)
+averaged_systolic_model_1_gender_int <- model.avg(dredged_systolic_model_1_gender_int, subset = delta < 2)
+
+summary(averaged_systolic_model_1_gender_int)
+sw(averaged_systolic_model_1_gender_int)
+```
+
+### Systolic Hypertension — Sex Interaction
+
+```{r systolic-htn-sex-int}
+systolic_htn_model_gender_int <- glm(
+  bin_systolic_htn ~ village + log_BMI + age + I(age^2) + gender_f + wealth_index +
+    bin_pos_necator     + bin_pos_necator:wealth_index     + bin_pos_necator:gender_f +
+    bin_pos_ancylostoma + bin_pos_ancylostoma:wealth_index + bin_pos_ancylostoma:gender_f,
+  data = merged_df_for_model, na.action = na.fail, family = "binomial"
+)
+
+dredged_systolic_htn_model_gender_int  <- dredge(systolic_htn_model_gender_int)
+averaged_systolic_htn_model_gender_int <- model.avg(dredged_systolic_htn_model_gender_int, subset = delta < 2)
+
+summary(averaged_systolic_htn_model_gender_int)
+sw(averaged_systolic_htn_model_gender_int)
+```
+
+### Diastolic BP — Sex Interaction
+
+```{r diastolic-sex-int}
+diastolic_model_1_gender_int <- lm(
+  log_diastolic ~ village + log_BMI + age + I(age^2) + gender_f + wealth_index +
+    bin_pos_necator     + bin_pos_necator:wealth_index     + bin_pos_necator:gender_f +
+    bin_pos_ancylostoma + bin_pos_ancylostoma:wealth_index + bin_pos_ancylostoma:gender_f,
+  data = merged_df_for_model, na.action = na.fail
+)
+
+dredged_diastolic_model_1_gender_int  <- dredge(diastolic_model_1_gender_int)
+averaged_diastolic_model_1_gender_int <- model.avg(dredged_diastolic_model_1_gender_int, subset = delta < 2)
+
+summary(averaged_diastolic_model_1_gender_int)
+sw(averaged_diastolic_model_1_gender_int)
+```
+
+### Diastolic Hypertension — Sex Interaction
+
+```{r diastolic-htn-sex-int}
+diastolic_htn_model_gender_int <- glm(
+  bin_diastolic_htn ~ village + log_BMI + age + I(age^2) + gender_f + wealth_index +
+    bin_pos_necator     + bin_pos_necator:wealth_index     + bin_pos_necator:gender_f +
+    bin_pos_ancylostoma + bin_pos_ancylostoma:wealth_index + bin_pos_ancylostoma:gender_f,
+  data = merged_df_for_model, na.action = na.fail, family = "binomial"
+)
+
+dredged_diastolic_htn_model_gender_int  <- dredge(diastolic_htn_model_gender_int)
+averaged_diastolic_htn_model_gender_int <- model.avg(dredged_diastolic_htn_model_gender_int, subset = delta < 2)
+
+summary(averaged_diastolic_htn_model_gender_int)
+sw(averaged_diastolic_htn_model_gender_int)
+```
+
+### Combined Coefficient Plot — Sex Interaction Models
+
+```{r sex-int-coef-plots, fig.width=12, fig.height=8}
+coef_sys_sex     <- extract_coef_table(averaged_systolic_model_1_gender_int,   labels = var_labels) |> complete_coef_table(master_var_order_sex)
+coef_sys_htn_sex <- extract_coef_table(averaged_systolic_htn_model_gender_int, labels = var_labels) |> complete_coef_table(master_var_order_sex)
+coef_dia_sex     <- extract_coef_table(averaged_diastolic_model_1_gender_int,  labels = var_labels) |> complete_coef_table(master_var_order_sex)
+coef_dia_htn_sex <- extract_coef_table(averaged_diastolic_htn_model_gender_int,labels = var_labels) |> complete_coef_table(master_var_order_sex)
+
+
+combined_bp_sex <- bind_coef_tables(
+  coef_sys_sex, coef_dia_sex,
+  outcomes = c("Systolic", "Diastolic")
+)
+
+combined_htn_sex <- bind_coef_tables(
+  coef_sys_htn_sex, coef_dia_htn_sex,
+  outcomes = c("Systolic", "Diastolic")
+)
+
+importance_range_sex <- range(c(combined_htn_sex$Importance, combined_bp_sex$Importance), na.rm = TRUE)
+
+
+p_bp_sex <- plot_combined_outcomes(
+  combined_bp_sex,
+  plot_title        = "Continuous Blood Pressure",
+  x_limits          = c(-0.5, 0.6),
+  importance_limits = importance_range_sex,
+  outcome_colors    = bp_colors
+)
+
+p_htn_sex <- plot_combined_outcomes(
+  combined_htn_sex,
+  plot_title        = "Hypertension (Logit-linked)",
+  x_limits          = c(-1, 1),
+  importance_limits = importance_range_sex,
+  outcome_colors    = htn_colors
+)
+
+combined_plot <- (p_bp_sex | p_htn_sex)  +
+  plot_layout(guides = "collect") & theme(legend.position = "bottom")
+
+combined_plot + plot_annotation(tag_levels = "A")
+
+ggsave("bp_sex_interaction_plot_supp.jpeg", path = "/Users/levkolinski/Desktop/hookworm_bmi_bloodpressure/Figures/", 
+       units="in", width=13, height=8, dpi=350, device = "jpeg", bg = "white")
+```
+
+## WHO Hypertension Cutoffs
+
+### Systolic Hypertension (>140 mmHg)
+
+```{r systolic-htn-who}
+systolic_htn_model_who <- glm(
+  bin_systolic_htn_who ~ village + log_BMI + age + I(age^2) + gender_f + wealth_index +
+    bin_pos_necator + bin_pos_necator:wealth_index +
+    bin_pos_ancylostoma + bin_pos_ancylostoma:wealth_index,
+  data = merged_df_for_model, na.action = na.fail, family = "binomial"
+)
+
+dredged_systolic_htn_model_who  <- dredge(systolic_htn_model_who, subset = !(`I(age^2)`) | age)
+averaged_systolic_htn_model_who <- model.avg(dredged_systolic_htn_model_who, subset = delta < 2)
+
+summary(averaged_systolic_htn_model_who)
+sw(averaged_systolic_htn_model_who)
+```
+
+### Diastolic Hypertension (>90 mmHg)
+
+```{r diastolic-htn-who}
+diastolic_htn_model_who <- glm(
+  bin_diastolic_htn_who ~ village + log_BMI + age + I(age^2) + gender_f + wealth_index +
+    bin_pos_necator + bin_pos_necator:wealth_index +
+    bin_pos_ancylostoma + bin_pos_ancylostoma:wealth_index,
+  data = merged_df_for_model, na.action = na.fail, family = "binomial"
+)
+
+dredged_diastolic_htn_model_who  <- dredge(diastolic_htn_model_who, subset = !(`I(age^2)`) | age)
+averaged_diastolic_htn_model_who <- model.avg(dredged_diastolic_htn_model_who, subset = delta < 2)
+
+summary(averaged_diastolic_htn_model_who)
+sw(averaged_diastolic_htn_model_who)
+```
+
+### Combined WHO Coefficient Plot
+
+```{r who-coef-plots, fig.width=12, fig.height=5}
+coef_sys_htn_who <- extract_coef_table(averaged_systolic_htn_model_who,  labels = var_labels) |> complete_coef_table(master_var_order)
+coef_dia_htn_who <- extract_coef_table(averaged_diastolic_htn_model_who, labels = var_labels) |> complete_coef_table(master_var_order)
+
+importance_range_who <- range(c(coef_sys_htn_who$Importance, coef_dia_htn_who$Importance), na.rm = TRUE)
+
+x_range_who <- range(c(coef_sys_htn_who$CI_lower_95, coef_sys_htn_who$CI_upper_95,
+                       coef_dia_htn_who$CI_lower_95, coef_dia_htn_who$CI_upper_95), na.rm = TRUE) * 1.1
+
+p_sys_who <- plot_modelavg_coef_shared(coef_sys_htn_who, "Systolic Hypertension (WHO)",
+                                       x_limits = x_range_who, importance_limits = importance_range_who)
+p_dia_who <- plot_modelavg_coef_shared(coef_dia_htn_who, "Diastolic Hypertension (WHO)",
+                                       x_limits = x_range_who, importance_limits = importance_range_who)
+
+(p_sys_who | p_dia_who) +
+  plot_layout(guides = "collect") & theme(legend.position = "bottom")
+
+ggsave("who_bp_plot_supp.jpeg", path = "/Users/levkolinski/Desktop/hookworm_bmi_bloodpressure/Figures/", 
+       units="in",  width=14, height=8, dpi=350, device = "jpeg", bg = "white")
+```
