@@ -323,10 +323,10 @@ merged_df_for_model <- merged_df |>
   mutate(
     bin_pos_necator       = as.integer(pos_necator),
     bin_pos_ancylostoma   = as.integer(pos_ancylostoma),
-    bin_systolic_htn      = ifelse(average_systolic  > 129, 1L, 0L),
-    bin_diastolic_htn     = ifelse(average_diastolic > 79,  1L, 0L),
-    bin_systolic_htn_who  = ifelse(average_systolic  > 139, 1L, 0L),
-    bin_diastolic_htn_who = ifelse(average_diastolic > 89,  1L, 0L)
+    bin_systolic_htn      = ifelse(average_systolic  >= 130, 1L, 0L),
+    bin_diastolic_htn     = ifelse(average_diastolic >= 80,  1L, 0L),
+    bin_systolic_htn_who  = ifelse(average_systolic  >= 140, 1L, 0L),
+    bin_diastolic_htn_who = ifelse(average_diastolic >= 90,  1L, 0L)
   ) |>
   drop_na()
 
@@ -519,8 +519,8 @@ ggplot(data = merged_df_for_model, aes(x = BMI)) +
 ### Blood Pressure
 
 ```{r bp-descriptive}
-n_hypertensive <- merged_df_for_model |> filter(average_systolic > 129 | average_diastolic > 79) |> nrow()
-cat("Hypertensive (systolic >129 OR diastolic >79):", paste0(round(n_hypertensive / N * 100, 2), "%"), "\n")
+n_hypertensive <- merged_df_for_model |> filter(average_systolic >= 130 | average_diastolic >= 80) |> nrow()
+cat("Hypertensive (systolic >=130 OR diastolic =80):", paste0(round(n_hypertensive / N * 100, 2), "%"), "\n")
 
 ggplot(merged_df_for_model, aes(x = age, y = average_systolic, color = gender)) +
   geom_point() +
@@ -565,8 +565,8 @@ p_bmi <- plot_modelavg_coef_shared(
 )
 p_bmi + theme(legend.position = "right")
 
-ggsave("bmi_plot_main.jpeg", path = "/Users/levkolinski/Desktop/hookworm_bmi_bloodpressure/Figures/", 
-       units="in", width=10, height=7, dpi=350, device = "jpeg", bg = "white")
+# ggsave("bmi_plot_main.jpeg", path = "/Users/levkolinski/Desktop/hookworm_bmi_bloodpressure/Figures/", 
+#        units="in", width=10, height=7, dpi=350, device = "jpeg", bg = "white")
 
 # Get the scaling parameters used for log_BMI
 log_bmi_values <- log(as.numeric(merged_df_for_model$BMI))
@@ -626,7 +626,7 @@ bootstrap_pairwise_diff_bmi <- function(df, group_var, group1, group2, outcome =
   boot_fun <- function(data, indices) {
     d <- data[indices, ]
     if (length(unique(d[[group_var]])) < 2) return(NA)
-    f     <- as.formula(paste(outcome, "~", group_var, "+ village + age + I(age^2) + wealth_index + gender"))
+    f     <- as.formula(paste(outcome, "~", group_var, "+ village + age + I(age^2) + wealth_index + gender_f"))
     model <- tryCatch(lm(f, data = d), error = function(e) NULL)
     if (is.null(model) || any(is.na(coef(model)))) return(NA)
     preds <- d; preds[[group_var]] <- group1; mean1 <- mean(predict(model, newdata = preds), na.rm = TRUE)
@@ -867,9 +867,9 @@ combined_plot <- (p_bp | p_htn)  +
   plot_layout(guides = "collect") & theme(legend.position = "bottom")
 
 combined_plot + plot_annotation(tag_levels = "A")
-
-ggsave("bp_plot_main.jpeg", path = "/Users/levkolinski/Desktop/hookworm_bmi_bloodpressure/Figures/", 
-       units="in", width=13, height=8, dpi=350, device = "jpeg", bg = "white")
+# 
+# ggsave("bp_plot_main.jpeg", path = "/Users/levkolinski/Desktop/hookworm_bmi_bloodpressure/Figures/", 
+#        units="in", width=13, height=8, dpi=350, device = "jpeg", bg = "white")
 
 ```
 
@@ -883,7 +883,7 @@ bootstrap_pairwise_diff_blood_pressure <- function(df, group_var, group1, group2
   boot_fun <- function(data, indices) {
     d <- data[indices, ]
     if (length(unique(d[[group_var]])) < 2) return(NA)
-    f     <- as.formula(paste(outcome, "~", group_var, "+ village + log_BMI + age + I(age^2) + wealth_index + gender"))
+    f     <- as.formula(paste(outcome, "~", group_var, "+ village + log_BMI + age + I(age^2) + wealth_index + gender_f"))
     model <- tryCatch(lm(f, data = d), error = function(e) NULL)
     if (is.null(model) || any(is.na(coef(model)))) return(NA)
     preds <- d; preds[[group_var]] <- group1; mean1 <- mean(predict(model, newdata = preds), na.rm = TRUE)
@@ -1296,7 +1296,7 @@ bmi_model_with_gender_int <- lm(
   data = merged_df_for_model, na.action = na.fail
 )
 
-dredged_bmi_model_with_gender_int  <- dredge(bmi_model_with_gender_int)
+dredged_bmi_model_with_gender_int  <- dredge(bmi_model_with_gender_int, subset = !(`I(age^2)`) | age)
 averaged_bmi_model_with_gender_int <- model.avg(dredged_bmi_model_with_gender_int, subset = delta < 2)
 
 summary(averaged_bmi_model_with_gender_int)
@@ -1310,8 +1310,8 @@ p_bmi_sex <- plot_modelavg_coef_shared(coef_bmi_sex, "BMI",
                                        importance_limits = c(0.2, 1))
 p_bmi_sex + theme(legend.position = "right")
 
-ggsave("bmi_sex_interaction_plot_supp.jpeg", path = "/Users/levkolinski/Desktop/hookworm_bmi_bloodpressure/Figures/", 
-       units="in", width=10, height=7, dpi=350, device = "jpeg", bg = "white")
+# ggsave("bmi_sex_interaction_plot_supp.jpeg", path = "/Users/levkolinski/Desktop/hookworm_bmi_bloodpressure/Figures/", 
+#        units="in", width=10, height=7, dpi=350, device = "jpeg", bg = "white")
 ```
 
 ### Systolic BP — Sex Interaction
@@ -1324,7 +1324,7 @@ systolic_model_1_gender_int <- lm(
   data = merged_df_for_model, na.action = na.fail
 )
 
-dredged_systolic_model_1_gender_int  <- dredge(systolic_model_1_gender_int)
+dredged_systolic_model_1_gender_int  <- dredge(systolic_model_1_gender_int, subset = !(`I(age^2)`) | age)
 averaged_systolic_model_1_gender_int <- model.avg(dredged_systolic_model_1_gender_int, subset = delta < 2)
 
 summary(averaged_systolic_model_1_gender_int)
@@ -1341,7 +1341,7 @@ systolic_htn_model_gender_int <- glm(
   data = merged_df_for_model, na.action = na.fail, family = "binomial"
 )
 
-dredged_systolic_htn_model_gender_int  <- dredge(systolic_htn_model_gender_int)
+dredged_systolic_htn_model_gender_int  <- dredge(systolic_htn_model_gender_int, subset = !(`I(age^2)`) | age)
 averaged_systolic_htn_model_gender_int <- model.avg(dredged_systolic_htn_model_gender_int, subset = delta < 2)
 
 summary(averaged_systolic_htn_model_gender_int)
@@ -1358,7 +1358,7 @@ diastolic_model_1_gender_int <- lm(
   data = merged_df_for_model, na.action = na.fail
 )
 
-dredged_diastolic_model_1_gender_int  <- dredge(diastolic_model_1_gender_int)
+dredged_diastolic_model_1_gender_int  <- dredge(diastolic_model_1_gender_int, subset = !(`I(age^2)`) | age)
 averaged_diastolic_model_1_gender_int <- model.avg(dredged_diastolic_model_1_gender_int, subset = delta < 2)
 
 summary(averaged_diastolic_model_1_gender_int)
@@ -1375,7 +1375,7 @@ diastolic_htn_model_gender_int <- glm(
   data = merged_df_for_model, na.action = na.fail, family = "binomial"
 )
 
-dredged_diastolic_htn_model_gender_int  <- dredge(diastolic_htn_model_gender_int)
+dredged_diastolic_htn_model_gender_int  <- dredge(diastolic_htn_model_gender_int, subset = !(`I(age^2)`) | age)
 averaged_diastolic_htn_model_gender_int <- model.avg(dredged_diastolic_htn_model_gender_int, subset = delta < 2)
 
 summary(averaged_diastolic_htn_model_gender_int)
@@ -1425,8 +1425,8 @@ combined_plot <- (p_bp_sex | p_htn_sex)  +
 
 combined_plot + plot_annotation(tag_levels = "A")
 
-ggsave("bp_sex_interaction_plot_supp.jpeg", path = "/Users/levkolinski/Desktop/hookworm_bmi_bloodpressure/Figures/", 
-       units="in", width=13, height=8, dpi=350, device = "jpeg", bg = "white")
+# ggsave("bp_sex_interaction_plot_supp.jpeg", path = "/Users/levkolinski/Desktop/hookworm_bmi_bloodpressure/Figures/", 
+#        units="in", width=13, height=8, dpi=350, device = "jpeg", bg = "white")
 ```
 
 ## WHO Hypertension Cutoffs
@@ -1483,7 +1483,7 @@ p_dia_who <- plot_modelavg_coef_shared(coef_dia_htn_who, "Diastolic Hypertension
 
 (p_sys_who | p_dia_who) +
   plot_layout(guides = "collect") & theme(legend.position = "bottom")
-
-ggsave("who_bp_plot_supp.jpeg", path = "/Users/levkolinski/Desktop/hookworm_bmi_bloodpressure/Figures/", 
-       units="in",  width=14, height=8, dpi=350, device = "jpeg", bg = "white")
+# 
+# ggsave("who_bp_plot_supp.jpeg", path = "/Users/levkolinski/Desktop/hookworm_bmi_bloodpressure/Figures/", 
+#        units="in",  width=14, height=8, dpi=350, device = "jpeg", bg = "white")
 ```
