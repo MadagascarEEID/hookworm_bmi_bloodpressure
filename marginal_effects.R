@@ -6,19 +6,21 @@ library(ggplot2)
 library(purrr)
 library(marginaleffects)
 # 
-# bmi_model_1 <- lm(
-#   log_BMI ~ village + age + age2 + gender_f + wealth_index +
-#     bin_pos_necator + bin_pos_ancylostoma + bin_pos_ancylostoma:bin_pos_necator + 
-#     bin_pos_necator:wealth_index + bin_pos_ancylostoma:wealth_index,
-#   data = merged_df_for_model, na.action = na.fail
-# )
+bmi_model_1 <- lm(
+  log_BMI ~ village + age + age2 + gender_f + wealth_index +
+    bin_pos_necator + bin_pos_ancylostoma + bin_pos_ancylostoma:bin_pos_necator +
+    bin_pos_necator:wealth_index + bin_pos_ancylostoma:wealth_index +
+    bin_pos_ancylostoma:bin_pos_necator:wealth_index,
+  data = merged_df_for_model, na.action = na.fail
+)
 # 
-# dredged_bmi_model_1  <- dredge(bmi_model_1, subset = (!age2 | age) &
-#                                  (!`bin_pos_ancylostoma:bin_pos_necator` | (bin_pos_necator & bin_pos_ancylostoma)) &
-#                                  (!`bin_pos_necator:wealth_index` | (bin_pos_necator & wealth_index)) &
-#                                  (!`bin_pos_ancylostoma:wealth_index` | (bin_pos_ancylostoma & wealth_index)))
-# 
-# averaged_bmi_model_1 <- model.avg(dredged_bmi_model_1, subset = delta < 2)
+dredged_bmi_model_1  <- dredge(bmi_model_1, subset = (!age2 | age) &
+                                 (!`bin_pos_ancylostoma:bin_pos_necator` | (bin_pos_necator & bin_pos_ancylostoma)) &
+                                 (!`bin_pos_necator:wealth_index` | (bin_pos_necator & wealth_index)) &
+                                 (!`bin_pos_ancylostoma:bin_pos_necator:wealth_index` | (bin_pos_necator & bin_pos_ancylostoma & wealth_index)) &
+                                 (!`bin_pos_ancylostoma:wealth_index` | (bin_pos_ancylostoma & wealth_index)))
+
+averaged_bmi_model_1 <- model.avg(dredged_bmi_model_1, subset = delta < 2)
 
 # BMI MARGINAL EFFECTS ----
 
@@ -163,5 +165,5 @@ ggplot() +
         plot.title  = element_text(size = 16))
 
 ## saving----
-ggsave("bmi_marginal_effects.jpeg", path = "/Users/levkolinski/Desktop/hookworm_bmi_bloodpressure/Figures/R1/",
-              units="in", width=10, height=7, dpi=350, device = "jpeg", bg = "white")
+# ggsave("bmi_marginal_effects.jpeg", path = "/Users/levkolinski/Desktop/hookworm_bmi_bloodpressure/Figures/R1/",
+#               units="in", width=10, height=7, dpi=350, device = "jpeg", bg = "white")
